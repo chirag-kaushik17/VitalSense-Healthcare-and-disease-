@@ -1,9 +1,12 @@
 from collections.abc import Callable
+from datetime import datetime
+from pathlib import Path
 from typing import TypeVar
 from uuid import UUID
 
 from fastapi import Depends, FastAPI, HTTPException, Query, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, RedirectResponse
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -15,6 +18,9 @@ from app.schemas import (
     RiskPredictionRead, RiskResult, VitalCreate, VitalRead,
 )
 from app.similarity import compute_patient_risk
+
+BASE_DIR = Path(__file__).resolve().parent
+STATIC_DIR = BASE_DIR / "static"
 
 app = FastAPI(title="VitalSense API", version="0.1.0")
 app.add_middleware(
@@ -29,9 +35,106 @@ ModelT = TypeVar("ModelT")
 CreateT = TypeVar("CreateT")
 
 
+@app.get("/", include_in_schema=False)
+def root() -> RedirectResponse:
+    return RedirectResponse(url="/ui", status_code=status.HTTP_307_TEMPORARY_REDIRECT)
+
+
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.get("/ui", include_in_schema=False)
+def ui_page() -> FileResponse:
+    return FileResponse(STATIC_DIR / "index.html")
+
+
+def _patient_age(patient: Patient, latest_encounter: datetime | None) -> int:
+    if latest_encounter is None:
+        return 65
+    delta = latest_encounter.date() - patient.date_of_birth
+    return max(0, int(delta.days / 365.25))
+
+
+def _latest_patient_vitals(db: Session, patient_id: UUID) -> dict[str, float]:
+    latest_vital = db.execute(
+        select(Vital).where(Vital.patient_id == patient_id).order_by(Vital.measured_at.desc()).limit(1)
+    ).scalar_one_or_none()
+    if latest_vital is None:
+        return {}
+    values: dict[str, float] = {}
+    for field in ["heart_rate", "systolic_bp", "diastolic_bp", "respiratory_rate", "temperature_c", "oxygen_saturation"]:
+        value = getattr(latest_vital, field, None)
+        if value is not None:
+            values[field] = float(value)
+    return values
+
+
+@app.get("/patients/{patient_id}/summary")
+def patient_summary(patient_id: UUID, db: Session = Depends(get_db)) -> dict:
+    patient = get_resource(Patient, patient_id, db)
+    latest_encounter = db.execute(
+        select(Encounter.started_at).where(Encounter.patient_id == patient_id).order_by(Encounter.started_at.desc()).limit(1)
+    ).scalar_one_or_none()
+    active_conditions = list(
+        db.scalars(
+            select(Condition.display)
+            .where(Condition.patient_id == patient_id)
+            .where(Condition.status != "resolved")
+            .order_by(Condition.recorded_at.desc())
+            .limit(10)
+        )
+    )
+    return {
+        "id": patient.id,
+        "mrn": patient.mrn,
+        "age": _patient_age(patient, latest_encounter),
+        "sex": patient.sex,
+        "ethnicity": patient.ethnicity,
+        "smoking_status": patient.smoking_status,
+        "active_conditions": active_conditions,
+        "latest_vitals": _latest_patient_vitals(db, patient_id),
+    }
+
+
+def _compute_demo_examples(db: Session) -> dict[str, dict | None]:
+    cache_key = "demo_examples"
+    if hasattr(app.state, "demo_examples_cache") and app.state.demo_examples_cache:
+        return app.state.demo_examples_cache
+
+    patient_ids = list(db.scalars(select(Patient.id).order_by(Patient.id.asc())))
+    sample_size = min(len(patient_ids), 200)
+    selected: dict[str, dict | None] = {"low": None, "moderate": None, "high": None}
+    scored: list[dict] = []
+    for patient_id in patient_ids[:sample_size]:
+        try:
+            result = compute_patient_risk(db, patient_id, k=5)
+        except HTTPException:
+            continue
+        scored.append({
+            "patient_id": str(patient_id),
+            "mrn": db.get(Patient, patient_id).mrn if db.get(Patient, patient_id) else None,
+            "risk_score": float(result.risk_score),
+            "risk_category": result.risk_category,
+        })
+
+    for item in sorted(scored, key=lambda item: item["risk_score"], reverse=True):
+        category = item["risk_category"]
+        if category in selected and selected[category] is None:
+            selected[category] = {
+                "patient_id": item["patient_id"],
+                "mrn": item["mrn"],
+                "risk_score": round(item["risk_score"], 5),
+            }
+
+    app.state.demo_examples_cache = selected
+    return selected
+
+
+@app.get("/demo/examples")
+def demo_examples(db: Session = Depends(get_db)) -> dict[str, dict | None]:
+    return _compute_demo_examples(db)
 
 
 def create_resource(model: type[ModelT], payload: CreateT, db: Session) -> ModelT:
