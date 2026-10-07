@@ -1,0 +1,67 @@
+:root {
+  color-scheme: light;
+  --bg: #f3f7f7;
+  --surface: #ffffff;
+  --surface-muted: #f7f9f9;
+  --surface-raised: #ffffff;
+  --ink: #172b32;
+  --ink-soft: #40565d;
+  --muted: #687b80;
+  --line: #d9e3e3;
+  --line-strong: #bacaca;
+  --teal: #0f766e;
+  --teal-strong: #0b625b;
+  --teal-soft: #e0f2ef;
+  --blue: #2563a6;
+  --blue-soft: #e7f0fa;
+  --low: #18794e;
+  --low-soft: #e1f4e9;
+  --moderate: #9a5b00;
+  --moderate-soft: #fff2d6;
+  --high: #b42332;
+  --high-soft: #fde7e8;
+  --shadow: 0 8px 28px rgba(20, 47, 54, .06);
+  --radius: 12px;
+  --radius-sm: 8px;
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 24px;
+  --space-6: 32px;
+  --space-7: 48px;
+  --space-8: 64px;
+  --text-xs: 12px;
+  --text-sm: 14px;
+  --text-base: 16px;
+  --text-lg: 18px;
+  --text-xl: 24px;
+  --text-2xl: 32px;
+  --text-3xl: 44px;
+  font-family: system-ui, "Segoe UI", Roboto, sans-serif;
+}
+
+[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #111b25;
+  --surface: #182633;
+  --surface-muted: #1d2d3b;
+  --surface-raised: #203240;
+  --ink: #edf5f5;
+  --ink-soft: #ccdcdf;
+  --muted: #9cb0b5;
+  --line: #30444f;
+  --line-strong: #48616c;
+  --teal: #2dd4bf;
+  --teal-strong: #5ee6d3;
+  --teal-soft: #153f40;
+  --blue: #8abaff;
+  --blue-soft: #1e3854;
+  --low: #70daa4;
+  --low-soft: #173d32;
+  --moderate: #ffd071;
+  --moderate-soft: #49381d;
+  --high: #ff929c;
+  --high-soft: #4a292f;
+  --shadow: 0 8px 28px rgba(0, 0, 0, .18);
+}

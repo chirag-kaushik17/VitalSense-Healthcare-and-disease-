@@ -100,7 +100,7 @@ def _load_patient_metadata(db: Session) -> tuple[dict[UUID, datetime], dict[UUID
     return encounter_dates, condition_flags, latest_observations, patients
 
 
-def _build_feature_cache(db: Session) -> tuple[pd.DataFrame, dict[UUID, int], dict[UUID, Any], dict[UUID, float], dict[UUID, list[dict[str, Any]]]]:
+def _build_feature_cache(db: Session) -> dict[str, Any]:
     encounter_dates, condition_flags, latest_observations, patients = _load_patient_metadata(db)
     smoking_values = [value for patient in patients for value in [SMOKING_STATUS_MAP.get((patient.smoking_status or "").strip().lower())] if value is not None]
     median_smoking = float(np.median(smoking_values)) if smoking_values else 1.0
@@ -149,6 +149,7 @@ def _build_feature_cache(db: Session) -> tuple[pd.DataFrame, dict[UUID, int], di
 
     numeric_columns = [column for column in frame.columns if column not in {"patient_id"}]
     frame[numeric_columns] = frame[numeric_columns].apply(pd.to_numeric, errors="coerce")
+    raw_frame = frame.copy(deep=True)
     median_values = frame[numeric_columns].median().fillna(0.0)
     frame[numeric_columns] = frame[numeric_columns].fillna(median_values).fillna(0.0)
 
@@ -159,12 +160,48 @@ def _build_feature_cache(db: Session) -> tuple[pd.DataFrame, dict[UUID, int], di
     own_risk_values = {}
     out_of_range_map: dict[UUID, list[dict[str, Any]]] = {}
     for idx, patient in enumerate(patients):
-        patient_row = frame.iloc[idx].to_dict()
+        patient_row = raw_frame.iloc[idx].to_dict()
         out_values, risk_value = _calculate_own_risk(patient_row)
         own_risk_values[patient.id] = risk_value
         out_of_range_map[patient.id] = out_values
 
-    return frame, patient_index, {"scaler": scaler, "scaled": scaled_values}, own_risk_values, out_of_range_map
+    similarity_matrix = cosine_similarity(scaled_values)
+    np.nan_to_num(similarity_matrix, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+    default_scores: dict[UUID, dict[str, Any]] = {}
+    patient_ids = [UUID(str(patient_id)) for patient_id in frame["patient_id"].tolist()]
+    for idx, patient_id in enumerate(patient_ids):
+        neighbor_indices = [
+            int(other_idx)
+            for other_idx in np.argsort(-similarity_matrix[idx])
+            if int(other_idx) != idx
+        ][:5]
+        high_risk_count = sum(
+            own_risk_values.get(patient_ids[other_idx], 0.0) >= HIGH_RISK_THRESHOLD
+            for other_idx in neighbor_indices
+        )
+        neighbor_fraction = high_risk_count / max(len(neighbor_indices), 1)
+        risk_score = min(1.0, 0.6 * own_risk_values.get(patient_id, 0.0) + 0.4 * neighbor_fraction)
+        category = "low" if risk_score < 0.33 else "moderate" if risk_score < 0.66 else "high"
+        default_scores[patient_id] = {
+            "risk_score": float(risk_score),
+            "risk_category": category,
+            "neighbor_fraction": float(neighbor_fraction),
+        }
+
+    return {
+        "frame": frame,
+        "patient_index": patient_index,
+        "scaler": scaler,
+        "scaled": scaled_values,
+        "similarities": similarity_matrix,
+        "own_risk": own_risk_values,
+        "out_of_range": out_of_range_map,
+        "default_scores": default_scores,
+        "patient_ids": patient_ids,
+        "patients": patients,
+        "encounter_dates": encounter_dates,
+        "latest_observations": latest_observations,
+    }
 
 
 def _calculate_own_risk(patient_row: dict[str, Any]) -> tuple[list[dict[str, Any]], float]:
@@ -207,7 +244,7 @@ def _calculate_own_risk(patient_row: dict[str, Any]) -> tuple[list[dict[str, Any
     return out_records, float(min(1.0, risk))
 
 
-def _get_cache(db: Session, refresh: bool = False) -> tuple[pd.DataFrame, dict[UUID, int], Any, dict[UUID, float], dict[UUID, list[dict[str, Any]]]]:
+def _get_cache(db: Session, refresh: bool = False) -> dict[str, Any]:
     cache_key = "global"
     with _CACHE_LOCK:
         if refresh:
@@ -217,16 +254,21 @@ def _get_cache(db: Session, refresh: bool = False) -> tuple[pd.DataFrame, dict[U
         return _CACHE[cache_key]
 
 
-def compute_patient_risk(db: Session, patient_id: UUID, k: int = 5, refresh: bool = False) -> RiskResult:
-    if refresh:
-        _CACHE.clear()
+def get_risk_cache(db: Session, refresh: bool = False) -> dict[str, Any]:
+    return _get_cache(db, refresh=refresh)
 
-    frame, patient_index, metadata, own_risk_values, out_of_range_map = _get_cache(db, refresh=refresh)
+
+def score_patient(db: Session, patient_id: UUID, k: int = 5, refresh: bool = False) -> RiskResult:
+    cache = _get_cache(db, refresh=refresh)
+    frame = cache["frame"]
+    patient_index = cache["patient_index"]
+    own_risk_values = cache["own_risk"]
+    out_of_range_map = cache["out_of_range"]
     if patient_id not in patient_index:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Patient not found")
 
     idx = patient_index[patient_id]
-    similarity_matrix = cosine_similarity(metadata["scaled"])
+    similarity_matrix = cache["similarities"]
     similarities = []
     for other_idx, other_id in enumerate(frame["patient_id"].tolist()):
         if other_idx == idx:
@@ -244,13 +286,11 @@ def compute_patient_risk(db: Session, patient_id: UUID, k: int = 5, refresh: boo
     top_neighbors = sorted(similarities, key=lambda item: item["similarity"], reverse=True)[: max(1, min(k, 20))]
     neighbor_high_risk_fraction = float(sum(1 for item in top_neighbors if item["high_risk"]) / max(len(top_neighbors), 1))
     own_risk = float(own_risk_values.get(patient_id, 0.0))
-    risk_score = float(min(1.0, 0.6 * own_risk + 0.4 * neighbor_high_risk_fraction))
-    if risk_score < 0.33:
-        category = "low"
-    elif risk_score < 0.66:
-        category = "moderate"
-    else:
-        category = "high"
+    default_score = cache["default_scores"].get(patient_id) if k == 5 else None
+    risk_score = float(default_score["risk_score"] if default_score else min(1.0, 0.6 * own_risk + 0.4 * neighbor_high_risk_fraction))
+    category = default_score["risk_category"] if default_score else (
+        "low" if risk_score < 0.33 else "moderate" if risk_score < 0.66 else "high"
+    )
 
     result = RiskResult(
         patient_id=patient_id,
@@ -279,20 +319,25 @@ def compute_patient_risk(db: Session, patient_id: UUID, k: int = 5, refresh: boo
         ],
     )
 
+    return result
+
+
+def compute_patient_risk(db: Session, patient_id: UUID, k: int = 5, refresh: bool = False) -> RiskResult:
+    result = score_patient(db, patient_id, k=k, refresh=refresh)
     persistence = RiskPrediction(
         patient_id=patient_id,
-        risk_score=Decimal(str(round(risk_score, 5))),
-        risk_category=category,
+        risk_score=Decimal(str(round(result.risk_score, 5))),
+        risk_category=result.risk_category,
         model_version=MODEL_VERSION,
         top_similar_patients=[
-            {"patient_id": str(neighborhood["patient_id"]), "similarity": float(neighborhood["similarity"])}
-            for neighborhood in top_neighbors
+            {"patient_id": str(neighborhood.patient_id), "similarity": float(neighborhood.similarity)}
+            for neighborhood in result.neighbors
         ],
         explanation={
-            "own_risk": own_risk,
-            "neighbor_fraction": neighbor_high_risk_fraction,
+            "own_risk": result.own_risk,
+            "neighbor_fraction": result.neighbor_high_risk_fraction,
             "weights": {"own_risk": 0.6, "neighbor_fraction": 0.4},
-            "out_of_range": _json_safe(out_of_range_map.get(patient_id, [])),
+            "out_of_range": _json_safe([item.model_dump() for item in result.out_of_range]),
         },
     )
     db.add(persistence)

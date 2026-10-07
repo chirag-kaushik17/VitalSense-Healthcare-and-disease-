@@ -7,7 +7,11 @@ VitalSense is a lightweight clinical-risk demo built around a FastAPI backend an
 - Exposes patient records, encounters, conditions, vitals, lab results, and risk predictions over a small REST API.
 - Computes a similarity-based risk score from patient age, sex, smoking status, latest vital signs, lab features, and active diagnoses.
 - Shows the explanation for a score through `neighbors` and `out_of_range` fields in the `/patients/{id}/risk` response.
-- Includes a simple one-page demo UI served from `/ui` for local review on one Windows laptop.
+- Includes an offline multi-page demo UI served from `/ui/` for local review.
+
+## Frontend
+The offline vanilla-JS app lives in the top-level `frontend/` folder; run the backend and open `http://127.0.0.1:8000/`.
+It uses `/stats/*`, `/patients/search`, `/patients/{id}/history`, `/meta/*`, and `/demo/examples` without a build step.
 
 ## Honest limitations
 

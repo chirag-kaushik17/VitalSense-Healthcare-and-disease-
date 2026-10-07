@@ -1,12 +1,14 @@
 from collections.abc import Callable
 from datetime import datetime
+import logging
 from pathlib import Path
 from typing import TypeVar
 from uuid import UUID
 
 from fastapi import Depends, FastAPI, HTTPException, Query, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, RedirectResponse
+from fastapi.responses import RedirectResponse
+from fastapi.staticfiles import StaticFiles
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -17,10 +19,11 @@ from app.schemas import (
     LabResultCreate, LabResultRead, PatientCreate, PatientRead,
     RiskPredictionRead, RiskResult, VitalCreate, VitalRead,
 )
-from app.similarity import compute_patient_risk
+from app.similarity import compute_patient_risk, get_risk_cache, score_patient
+from app.ui_api import invalidate_snapshot, router as ui_api_router
 
-BASE_DIR = Path(__file__).resolve().parent
-STATIC_DIR = BASE_DIR / "static"
+FRONTEND_DIR = Path(__file__).resolve().parents[2] / "frontend"
+logger = logging.getLogger(__name__)
 
 app = FastAPI(title="VitalSense API", version="0.1.0")
 app.add_middleware(
@@ -30,6 +33,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.include_router(ui_api_router)
 
 ModelT = TypeVar("ModelT")
 CreateT = TypeVar("CreateT")
@@ -37,17 +41,12 @@ CreateT = TypeVar("CreateT")
 
 @app.get("/", include_in_schema=False)
 def root() -> RedirectResponse:
-    return RedirectResponse(url="/ui", status_code=status.HTTP_307_TEMPORARY_REDIRECT)
+    return RedirectResponse(url="/ui/", status_code=status.HTTP_307_TEMPORARY_REDIRECT)
 
 
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
-
-
-@app.get("/ui", include_in_schema=False)
-def ui_page() -> FileResponse:
-    return FileResponse(STATIC_DIR / "index.html")
 
 
 def _patient_age(patient: Patient, latest_encounter: datetime | None) -> int:
@@ -99,33 +98,25 @@ def patient_summary(patient_id: UUID, db: Session = Depends(get_db)) -> dict:
 
 
 def _compute_demo_examples(db: Session) -> dict[str, dict | None]:
-    cache_key = "demo_examples"
     if hasattr(app.state, "demo_examples_cache") and app.state.demo_examples_cache:
         return app.state.demo_examples_cache
 
-    patient_ids = list(db.scalars(select(Patient.id).order_by(Patient.id.asc())))
-    sample_size = min(len(patient_ids), 200)
+    risk_cache = get_risk_cache(db)
+    patient_by_id = {patient.id: patient for patient in risk_cache["patients"]}
     selected: dict[str, dict | None] = {"low": None, "moderate": None, "high": None}
-    scored: list[dict] = []
-    for patient_id in patient_ids[:sample_size]:
-        try:
-            result = compute_patient_risk(db, patient_id, k=5)
-        except HTTPException:
-            continue
-        scored.append({
-            "patient_id": str(patient_id),
-            "mrn": db.get(Patient, patient_id).mrn if db.get(Patient, patient_id) else None,
-            "risk_score": float(result.risk_score),
-            "risk_category": result.risk_category,
-        })
-
-    for item in sorted(scored, key=lambda item: item["risk_score"], reverse=True):
-        category = item["risk_category"]
+    scored = sorted(
+        risk_cache["default_scores"].items(),
+        key=lambda item: item[1]["risk_score"],
+        reverse=True,
+    )
+    for patient_id, result in scored:
+        category = result["risk_category"]
         if category in selected and selected[category] is None:
+            patient = patient_by_id[patient_id]
             selected[category] = {
-                "patient_id": item["patient_id"],
-                "mrn": item["mrn"],
-                "risk_score": round(item["risk_score"], 5),
+                "patient_id": str(patient_id),
+                "mrn": patient.mrn,
+                "risk_score": round(result["risk_score"], 5),
             }
 
     app.state.demo_examples_cache = selected
@@ -177,8 +168,20 @@ def get_patient(patient_id: UUID, db: Session = Depends(get_db)) -> Patient:
 
 
 @app.get("/patients/{patient_id}/risk", response_model=RiskResult)
-def patient_risk(patient_id: UUID, db: Session = Depends(get_db), k: int = Query(5, ge=1, le=20), refresh: bool = False) -> RiskResult:
-    return compute_patient_risk(db, patient_id, k=k, refresh=refresh)
+def patient_risk(
+    patient_id: UUID,
+    db: Session = Depends(get_db),
+    k: int = Query(5, ge=1, le=20),
+    refresh: bool = Query(False),
+    persist: bool = Query(True),
+) -> RiskResult:
+    if refresh:
+        invalidate_snapshot()
+    if not persist:
+        return score_patient(db, patient_id, k=k, refresh=refresh)
+    result = compute_patient_risk(db, patient_id, k=k, refresh=refresh)
+    invalidate_snapshot()
+    return result
 
 
 @app.post("/encounters", response_model=EncounterRead, status_code=status.HTTP_201_CREATED)
@@ -323,3 +326,9 @@ def update_vital(resource_id: UUID, payload: VitalCreate, db: Session = Depends(
 @app.delete("/vitals/{resource_id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_vital(resource_id: UUID, db: Session = Depends(get_db)) -> None:
     delete_resource(Vital, resource_id, db)
+
+
+if FRONTEND_DIR.is_dir():
+    app.mount("/ui", StaticFiles(directory=FRONTEND_DIR, html=True), name="frontend")
+else:
+    logger.warning("Frontend directory %s is missing; /ui will not be served", FRONTEND_DIR)
